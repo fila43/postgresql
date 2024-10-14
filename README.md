@@ -1,6 +1,6 @@
 # PostgreSQL system role
 
-[![ansible-lint.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-lint.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-lint.yml) [![ansible-test.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-test.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-test.yml) [![markdownlint.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/markdownlint.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/markdownlint.yml) [![woke.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/woke.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/woke.yml)
+[![ansible-lint.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-lint.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-lint.yml) [![ansible-test.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-test.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/ansible-test.yml) [![markdownlint.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/markdownlint.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/markdownlint.yml) [![tft.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/tft.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/tft.yml) [![tft_citest_bad.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/tft_citest_bad.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/tft_citest_bad.yml) [![woke.yml](https://github.com/linux-system-roles/postgresql/actions/workflows/woke.yml/badge.svg)](https://github.com/linux-system-roles/postgresql/actions/workflows/woke.yml)
 
 The PostgreSQL system role installs, configures, and starts the PostgreSQL
 server.
@@ -21,7 +21,7 @@ ansible-galaxy collection install -vv -r meta/collection-requirements.yml
 
 ## Role Variables
 
-### postgresql_verison
+### postgresql_version
 
 You can set the version of the PostgreSQL server to 10, 12, 13, 15 or 16.
 
