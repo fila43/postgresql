@@ -1235,6 +1235,16 @@
   check_hook => 'check_temp_buffers',
 },
 
+{ name => 'pq_recv_buffer_size', type => 'int', context => 'PGC_USERSET', group => 'RESOURCES_MEM',
+  short_desc => 'Sets the size of the network receive buffer for each backend.',
+  long_desc => 'Larger values can improve performance when receiving large messages, but consume more memory per connection.',
+  flags => 'GUC_UNIT_KB',
+  variable => 'pq_recv_buffer_size',
+  boot_val => '8',
+  min => '8',
+  max => 'MAX_KILOBYTES',
+},
+
 { name => 'port', type => 'int', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
   short_desc => 'Sets the TCP port the server listens on.',
   variable => 'PostPortNumber',

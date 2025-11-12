@@ -112,21 +112,29 @@ static List *sock_paths = NIL;
 /*
  * Buffers for low-level I/O.
  *
- * The receive buffer is fixed size. Send buffer is usually 8k, but can be
- * enlarged by pq_putmessage_noblock() if the message doesn't fit otherwise.
+ * Both send and receive buffers are dynamically allocated. Send buffer is
+ * usually 8k, but can be enlarged by pq_putmessage_noblock() if the message
+ * doesn't fit otherwise. Receive buffer size is configurable via the
+ * pq_recv_buffer_size GUC parameter.
  */
 
 #define PQ_SEND_BUFFER_SIZE 8192
-#define PQ_RECV_BUFFER_SIZE 8192
 
 static char *PqSendBuffer;
 static int	PqSendBufferSize;	/* Size send buffer */
 static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
 static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
 
-static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
+static char *PqRecvBuffer;		/* Dynamically allocated receive buffer */
+static int	PqRecvBufferSize;	/* Size of receive buffer */
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
 static int	PqRecvLength;		/* End of data available in PqRecvBuffer */
+
+/* Statistics for memmove optimization */
+static uint64 PqRecvbufCalls = 0;		/* Total pq_recvbuf() calls */
+static uint64 PqMemmoveCalls = 0;		/* Calls that did memmove */
+static uint64 PqMemmoveSkipped = 0;	/* Calls that skipped memmove */
+static uint64 PqMemmoveBytes = 0;		/* Total bytes moved */
 
 /*
  * Message status
@@ -148,6 +156,7 @@ static inline int internal_putbytes(const void *b, size_t len);
 static inline int internal_flush(void);
 static pg_noinline int internal_flush_buffer(const char *buf, size_t *start,
 											 size_t *end);
+static void pq_log_recvbuf_stats(void);
 
 static int	Lock_AF_UNIX(const char *unixSocketDir, const char *unixSocketPath);
 static int	Setup_AF_UNIX(const char *sock_path);
@@ -278,6 +287,8 @@ pq_init(ClientSocket *client_sock)
 	/* initialize state variables */
 	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
 	PqSendBuffer = MemoryContextAlloc(TopMemoryContext, PqSendBufferSize);
+	PqRecvBufferSize = pq_recv_buffer_size * 1024;	/* GUC is in KB */
+	PqRecvBuffer = MemoryContextAlloc(TopMemoryContext, PqRecvBufferSize);
 	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
 	PqCommBusy = false;
 	PqCommReadingMsg = false;
@@ -348,6 +359,9 @@ socket_comm_reset(void)
 static void
 socket_close(int code, Datum arg)
 {
+	/* Log pq_recvbuf statistics before closing */
+	pq_log_recvbuf_stats();
+
 	/* Nothing to do in a standalone backend, where MyProcPort is NULL. */
 	if (MyProcPort != NULL)
 	{
@@ -888,6 +902,53 @@ socket_set_nonblocking(bool nonblocking)
 }
 
 /* --------------------------------
+ *		is_current_message_partial - check if message at PqRecvPointer is incomplete
+ *
+ *		Checks only the single message starting at PqRecvPointer, not the
+ *		entire buffer. This is used to optimize memmove operations by
+ *		avoiding unnecessary data movement when the buffer contains only
+ *		complete messages.
+ *
+ *		Returns true if the message is incomplete (partial), false if it's
+ *		complete or if there's no data to check.
+ * --------------------------------
+ */
+static bool
+is_current_message_partial(void)
+{
+	int			pos = PqRecvPointer;
+	int			available = PqRecvLength - PqRecvPointer;
+	int32		msg_len;
+	int			total_size;
+
+	/* No data to check */
+	if (available <= 0)
+		return false;
+
+	/* Need at least 5 bytes for message header (type + length) */
+	if (available < 5)
+		return true;		/* Incomplete header = partial */
+
+	/* Read message length (4 bytes, network byte order) */
+	memcpy(&msg_len, PqRecvBuffer + pos + 1, 4);
+	msg_len = pg_ntoh32(msg_len);
+
+	/* Basic sanity check on message length */
+	if (msg_len < 4 || msg_len > PQ_LARGE_MESSAGE_LIMIT)
+		return true;		/* Invalid length = treat as partial */
+
+	/* Total message size = 1 byte type + msg_len */
+	total_size = 1 + msg_len;
+
+	/* Do we have the complete message in the buffer? */
+	if (available < total_size)
+		return true;		/* Incomplete message = partial */
+
+	/* Message is complete */
+	return false;
+}
+
+/* --------------------------------
  *		pq_recvbuf - load some bytes into the input buffer
  *
  *		returns 0 if OK, EOF if trouble
@@ -896,15 +957,71 @@ socket_set_nonblocking(bool nonblocking)
 static int
 pq_recvbuf(void)
 {
+	PqRecvbufCalls++;
+
 	if (PqRecvPointer > 0)
 	{
 		if (PqRecvLength > PqRecvPointer)
 		{
-			/* still some unread data, left-justify it in the buffer */
-			memmove(PqRecvBuffer, PqRecvBuffer + PqRecvPointer,
-					PqRecvLength - PqRecvPointer);
-			PqRecvLength -= PqRecvPointer;
-			PqRecvPointer = 0;
+			int			bytes_to_move = PqRecvLength - PqRecvPointer;
+
+			/*
+			 * We have unread data in the buffer.
+			 *
+			 * Optimization: Only do memmove when necessary to avoid
+			 * expensive data movement, especially with large buffers
+			 * and many small messages (e.g., in pipeline mode).
+			 *
+			 * We must do memmove if:
+			 * 1. We're in the middle of reading a message (PqCommReadingMsg),
+			 *    because the buffer may contain binary data that we can't
+			 *    safely parse for message boundaries.
+			 * 2. The current message at PqRecvPointer is incomplete (partial),
+			 *    because we need to move it to the beginning to receive the
+			 *    rest of the message.
+			 *
+			 * Otherwise, if we have only complete messages, we can skip the
+			 * memmove and let them wait in the buffer. New data will be
+			 * appended at PqRecvLength.
+			 */
+			if (PqCommReadingMsg)
+			{
+				/*
+				 * We're reading a message - the buffer may contain binary
+				 * data (e.g., BLOB data) that could be misinterpreted as
+				 * message headers. Always do memmove in this case.
+				 */
+				PqMemmoveCalls++;
+				PqMemmoveBytes += bytes_to_move;
+				memmove(PqRecvBuffer, PqRecvBuffer + PqRecvPointer,
+						bytes_to_move);
+				PqRecvLength -= PqRecvPointer;
+				PqRecvPointer = 0;
+			}
+			else if (is_current_message_partial())
+			{
+				/*
+				 * The current message is incomplete. Move it to the
+				 * beginning so we can receive the rest of it.
+				 */
+				PqMemmoveCalls++;
+				PqMemmoveBytes += bytes_to_move;
+				memmove(PqRecvBuffer, PqRecvBuffer + PqRecvPointer,
+						bytes_to_move);
+				PqRecvLength -= PqRecvPointer;
+				PqRecvPointer = 0;
+			}
+			else
+			{
+				/*
+				 * The current message (and possibly others) is complete.
+				 * No need to move data - complete messages can wait in the
+				 * buffer while we append new data at the end. This optimization
+				 * significantly reduces memmove overhead, especially in pipeline
+				 * mode with many small messages.
+				 */
+				PqMemmoveSkipped++;
+			}
 		}
 		else
 			PqRecvLength = PqRecvPointer = 0;
@@ -921,7 +1038,7 @@ pq_recvbuf(void)
 		errno = 0;
 
 		r = secure_read(MyProcPort, PqRecvBuffer + PqRecvLength,
-						PQ_RECV_BUFFER_SIZE - PqRecvLength);
+						PqRecvBufferSize - PqRecvLength);
 
 		if (r < 0)
 		{
@@ -2084,4 +2201,44 @@ retry:
 	}
 
 	return true;
+}
+
+/*
+ * pq_log_recvbuf_stats - Log statistics about pq_recvbuf() and memmove() optimization
+ *
+ * This function logs statistics to help measure the effectiveness of the
+ * memmove() optimization. Call it at backend exit or on demand.
+ */
+static void
+pq_log_recvbuf_stats(void)
+{
+	if (PqRecvbufCalls > 0)
+	{
+		double skip_rate = (PqMemmoveSkipped * 100.0) / PqRecvbufCalls;
+		double avg_bytes = PqMemmoveCalls > 0 ?
+			(double) PqMemmoveBytes / PqMemmoveCalls : 0;
+
+		elog(LOG, "pq_recvbuf stats: calls=%lu memmove=%lu skipped=%lu (%.1f%%) bytes_moved=%lu avg_bytes=%.1f",
+			 (unsigned long) PqRecvbufCalls,
+			 (unsigned long) PqMemmoveCalls,
+			 (unsigned long) PqMemmoveSkipped,
+			 skip_rate,
+			 (unsigned long) PqMemmoveBytes,
+			 avg_bytes);
+	}
+}
+
+/*
+ * pq_get_recvbuf_stats - Get statistics for SQL function
+ *
+ * Returns statistics about pq_recvbuf() calls and memmove() optimization.
+ */
+void
+pq_get_recvbuf_stats(uint64 *calls, uint64 *memmove_calls,
+					 uint64 *memmove_skipped, uint64 *memmove_bytes)
+{
+	*calls = PqRecvbufCalls;
+	*memmove_calls = PqMemmoveCalls;
+	*memmove_skipped = PqMemmoveSkipped;
+	*memmove_bytes = PqMemmoveBytes;
 }
